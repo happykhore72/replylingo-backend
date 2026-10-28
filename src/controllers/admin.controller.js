@@ -1,0 +1,1237 @@
+import Event from "../models/Event.js";
+import User from "../models/User.js";
+import AiCallLog from "../models/AiCallLog.js";
+import PurchaseSurvey from "../models/PurchaseSurvey.js";
+import { SURVEY_REASONS, SURVEY_USE_CASES, SURVEY_PLATFORMS } from "../config/purchaseSurvey.js";
+import {
+  PUSH_PLATFORMS,
+  getPushAudienceCounts,
+  sendAnnouncementPushToAllUsers,
+} from "../services/pushNotification.service.js";
+
+import {
+  EVENTS,
+  ERROR_TYPES,
+  ONBOARDING_SCREEN_COUNT,
+  PRODUCT_SCREENS,
+  RETENTION_DAYS,
+} from "../config/analyticsEvents.js";
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// Same shared-secret pattern as notifications.routes.js — there's no
+// admin-role concept on User yet. Set ADMIN_SECRET in .env; falls back to
+// CRON_SECRET so this works without extra config, but a dedicated
+// ADMIN_SECRET is recommended since the two protect very different things.
+function isAuthorized(req) {
+  const secret = process.env.ADMIN_SECRET || process.env.CRON_SECRET || 'im12khore';
+  return !!secret && req.query.secret === secret;
+}
+
+function pct(numerator, denominator) {
+  if (!denominator) return 0;
+  return Math.round((numerator / denominator) * 1000) / 10;
+}
+
+function parseRange(req) {
+  const to = req.query.to ? new Date(req.query.to) : new Date();
+  const from = req.query.from
+    ? new Date(req.query.from)
+    : new Date(to.getTime() - 30 * DAY_MS);
+  return { from, to };
+}
+
+// Translation analytics must report REAL translations only. The in-app demo
+// ("Try the sample") tags its audio_selected / translation_succeeded events
+// with params.source = "sample"; events with no source (older builds, and
+// every failure event) are real. These are passed as the optional `extraMatch`
+// argument of the helpers below.
+const REAL_ONLY = { "params.source": { $ne: "sample" } };
+const SAMPLE_ONLY = { "params.source": "sample" };
+
+// Unique-distinctId count per event name, in range.
+async function uniqueUserCounts(eventNames, from, to, extraMatch = {}) {
+  const rows = await Event.aggregate([
+    { $match: { eventName: { $in: eventNames }, createdAt: { $gte: from, $lte: to }, ...extraMatch } },
+    { $group: { _id: { eventName: "$eventName", distinctId: "$distinctId" } } },
+    { $group: { _id: "$_id.eventName", count: { $sum: 1 } } },
+  ]);
+  const map = Object.fromEntries(eventNames.map((n) => [n, 0]));
+  rows.forEach((r) => {
+    map[r._id] = r.count;
+  });
+  return map;
+}
+
+// Distinct users with ANY of the given events (a user with several of them is
+// counted once — unlike summing uniqueUserCounts values).
+async function uniqueUsersAcross(eventNames, from, to, extraMatch = {}) {
+  const rows = await Event.aggregate([
+    { $match: { eventName: { $in: eventNames }, createdAt: { $gte: from, $lte: to }, ...extraMatch } },
+    { $group: { _id: "$distinctId" } },
+    { $count: "count" },
+  ]);
+  return rows[0]?.count || 0;
+}
+
+// Raw row count per event name, in range (not deduped by user).
+async function totalCounts(eventNames, from, to, extraMatch = {}) {
+  const rows = await Event.aggregate([
+    { $match: { eventName: { $in: eventNames }, createdAt: { $gte: from, $lte: to }, ...extraMatch } },
+    { $group: { _id: "$eventName", count: { $sum: 1 } } },
+  ]);
+  const map = Object.fromEntries(eventNames.map((n) => [n, 0]));
+  rows.forEach((r) => {
+    map[r._id] = r.count;
+  });
+  return map;
+}
+
+// Unique-user counts for one event, bucketed by a params field (e.g.
+// onboarding slide number, permission type, signup method, error type).
+async function uniqueUserCountsByParam(eventName, paramKey, from, to, extraMatch = {}) {
+  const rows = await Event.aggregate([
+    { $match: { eventName, createdAt: { $gte: from, $lte: to }, ...extraMatch } },
+    { $group: { _id: { val: `$params.${paramKey}`, distinctId: "$distinctId" } } },
+    { $group: { _id: "$_id.val", count: { $sum: 1 } } },
+  ]);
+  const map = {};
+  rows.forEach((r) => {
+    map[String(r._id)] = r.count;
+  });
+  return map;
+}
+
+async function totalCountsByParam(eventName, paramKey, from, to, extraMatch = {}) {
+  const rows = await Event.aggregate([
+    { $match: { eventName, createdAt: { $gte: from, $lte: to }, ...extraMatch } },
+    { $group: { _id: `$params.${paramKey}`, count: { $sum: 1 } } },
+  ]);
+  const map = {};
+  rows.forEach((r) => {
+    map[String(r._id)] = r.count;
+  });
+  return map;
+}
+
+// Same idea as uniqueUserCountsByParam, but bucketed by a top-level Event
+// field (platform, appVersion) instead of a params.* value.
+async function uniqueUserCountsByField(eventName, field, from, to, extraMatch = {}) {
+  const rows = await Event.aggregate([
+    { $match: { eventName, createdAt: { $gte: from, $lte: to }, ...extraMatch } },
+    { $group: { _id: { val: `$${field}`, distinctId: "$distinctId" } } },
+    { $group: { _id: "$_id.val", count: { $sum: 1 } } },
+  ]);
+  const map = {};
+  rows.forEach((r) => {
+    map[r._id === null || r._id === undefined ? "unknown" : String(r._id)] = r.count;
+  });
+  return map;
+}
+
+// Same idea as totalCountsByParam, but bucketed by a top-level Event field
+// instead of a params.* value — raw row count, not deduped by user.
+async function totalCountsByField(eventName, field, from, to) {
+  const rows = await Event.aggregate([
+    { $match: { eventName, createdAt: { $gte: from, $lte: to } } },
+    { $group: { _id: `$${field}`, count: { $sum: 1 } } },
+  ]);
+  const map = {};
+  rows.forEach((r) => {
+    map[r._id === null || r._id === undefined ? "unknown" : String(r._id)] = r.count;
+  });
+  return map;
+}
+
+// Same idea as uniqueUserCountsByField, but additionally filters to rows
+// where params[paramKey] === paramValue before grouping by the top-level
+// field — e.g. purchase_failed events where error_type is specifically
+// "user_cancelled", bucketed by platform. No existing helper combines a
+// params-value filter with a top-level-field group in one aggregation.
+async function uniqueUserCountsByFieldAndParamValue(eventName, field, paramKey, paramValue, from, to) {
+  const rows = await Event.aggregate([
+    {
+      $match: {
+        eventName,
+        [`params.${paramKey}`]: paramValue,
+        createdAt: { $gte: from, $lte: to },
+      },
+    },
+    { $group: { _id: { val: `$${field}`, distinctId: "$distinctId" } } },
+    { $group: { _id: "$_id.val", count: { $sum: 1 } } },
+  ]);
+  const map = {};
+  rows.forEach((r) => {
+    map[r._id === null || r._id === undefined ? "unknown" : String(r._id)] = r.count;
+  });
+  return map;
+}
+
+// Merges several per-key maps (e.g. app opens / translations started /
+// translations succeeded, each bucketed by platform or appVersion) into one
+// row per key, computing a success rate from the two translation counts.
+function mergeBreakdown(appOpenMap, startedMap, succeededMap) {
+  const keys = new Set([
+    ...Object.keys(appOpenMap),
+    ...Object.keys(startedMap),
+    ...Object.keys(succeededMap),
+  ]);
+  const result = {};
+  keys.forEach((key) => {
+    const appOpens = appOpenMap[key] || 0;
+    const translationsAttempted = startedMap[key] || 0;
+    const translationsSucceeded = succeededMap[key] || 0;
+    result[key] = {
+      appOpens,
+      translationsAttempted,
+      translationsSucceeded,
+      successRate: pct(translationsSucceeded, translationsAttempted),
+    };
+  });
+  return result;
+}
+
+// Continuous day-by-day series for app opens / signups / successful
+// translations — capped to a trailing window so "All time" doesn't render a
+// years-long, unreadable chart.
+const MAX_TREND_DAYS = 90;
+
+async function computeDailyTrend(from, to) {
+  const dayMs = 24 * 60 * 60 * 1000;
+  const trendFrom = to.getTime() - from.getTime() > MAX_TREND_DAYS * dayMs
+    ? new Date(to.getTime() - MAX_TREND_DAYS * dayMs)
+    : from;
+
+  const rows = await Event.aggregate([
+    {
+      $match: {
+        $or: [
+          { eventName: { $in: [EVENTS.APP_OPEN, EVENTS.SIGNUP_COMPLETED] } },
+          // Real translations only — the sample demo is not a translation.
+          { eventName: EVENTS.TRANSLATION_SUCCEEDED, ...REAL_ONLY },
+        ],
+        createdAt: { $gte: trendFrom, $lte: to },
+      },
+    },
+    {
+      $group: {
+        _id: {
+          day: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: "UTC" } },
+          eventName: "$eventName",
+          distinctId: "$distinctId",
+        },
+      },
+    },
+    {
+      $group: {
+        _id: { day: "$_id.day", eventName: "$_id.eventName" },
+        count: { $sum: 1 },
+      },
+    },
+  ]);
+
+  const byDay = new Map();
+  rows.forEach((r) => {
+    const day = r._id.day;
+    if (!byDay.has(day)) byDay.set(day, { appOpens: 0, signups: 0, translationsSucceeded: 0 });
+    const bucket = byDay.get(day);
+    if (r._id.eventName === EVENTS.APP_OPEN) bucket.appOpens = r.count;
+    else if (r._id.eventName === EVENTS.SIGNUP_COMPLETED) bucket.signups = r.count;
+    else if (r._id.eventName === EVENTS.TRANSLATION_SUCCEEDED) bucket.translationsSucceeded = r.count;
+  });
+
+  const days = [];
+  const cursor = new Date(
+    Date.UTC(trendFrom.getUTCFullYear(), trendFrom.getUTCMonth(), trendFrom.getUTCDate()),
+  );
+  const endDay = new Date(Date.UTC(to.getUTCFullYear(), to.getUTCMonth(), to.getUTCDate()));
+  while (cursor <= endDay) {
+    const key = cursor.toISOString().slice(0, 10);
+    const bucket = byDay.get(key) || { appOpens: 0, signups: 0, translationsSucceeded: 0 };
+    days.push({ date: key, ...bucket });
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return days;
+}
+
+// Day-N retention for the cohort of users whose very first-ever app_open
+// falls inside [from, to]. Looks forward from each user's own first open,
+// so activity can (and should) extend past `to`.
+async function computeRetention(from, to) {
+  const cohortRows = await Event.aggregate([
+    { $match: { eventName: EVENTS.APP_OPEN } },
+    { $group: { _id: "$distinctId", firstOpenAt: { $min: "$createdAt" } } },
+    { $match: { firstOpenAt: { $gte: from, $lte: to } } },
+  ]);
+
+  const empty = () =>
+    RETENTION_DAYS.reduce((acc, d) => {
+      acc[`d${d}`] = { eligible: 0, returned: 0, pct: 0 };
+      return acc;
+    }, {});
+
+  if (cohortRows.length === 0) return empty();
+
+  const cohortIds = cohortRows.map((r) => r._id);
+  const firstOpenById = new Map(cohortRows.map((r) => [r._id, r.firstOpenAt]));
+
+  const activity = await Event.find({
+    eventName: EVENTS.APP_OPEN,
+    distinctId: { $in: cohortIds },
+  })
+    .select("distinctId createdAt")
+    .lean();
+
+  const activityByUser = new Map();
+  activity.forEach((e) => {
+    if (!activityByUser.has(e.distinctId)) activityByUser.set(e.distinctId, []);
+    activityByUser.get(e.distinctId).push(e.createdAt);
+  });
+
+  const now = new Date();
+  const result = {};
+
+  RETENTION_DAYS.forEach((day) => {
+    let eligible = 0;
+    let returned = 0;
+
+    cohortIds.forEach((id) => {
+      const firstOpen = firstOpenById.get(id);
+      const windowStart = new Date(firstOpen.getTime() + day * DAY_MS);
+      const windowEnd = new Date(firstOpen.getTime() + (day + 1) * DAY_MS);
+
+      // Can't judge Day-N retention until that day has fully elapsed.
+      if (windowEnd > now) return;
+      eligible += 1;
+
+      const opens = activityByUser.get(id) || [];
+      if (opens.some((t) => t >= windowStart && t < windowEnd)) returned += 1;
+    });
+
+    result[`d${day}`] = { eligible, returned, pct: pct(returned, eligible) };
+  });
+
+  return result;
+}
+
+// Subscription / free-trial reporting, built from the server-side sub_* events
+// the RevenueCat webhook writes (see revenuecat.webhook.controller.js) — those
+// are authoritative for trial outcomes and revenue. Revenue is summed ONLY
+// from the three events that represent a real charge, so a free trial can
+// never show up as revenue. Sandbox (test) purchases are excluded unless
+// ?includeSandbox=true.
+const REVENUE_EVENTS = [EVENTS.SUB_PAID_STARTED, EVENTS.SUB_TRIAL_CONVERTED, EVENTS.SUB_RENEWED];
+const SUB_EVENTS = [
+  EVENTS.SUB_TRIAL_STARTED,
+  EVENTS.SUB_TRIAL_CANCELLED,
+  EVENTS.SUB_TRIAL_EXPIRED,
+  EVENTS.SUB_TRIAL_CONVERTED,
+  EVENTS.SUB_PAID_STARTED,
+  EVENTS.SUB_RENEWED,
+  EVENTS.SUB_CANCELLED,
+  EVENTS.SUB_EXPIRED,
+];
+
+async function computeSubscriptionStats(from, to, includeSandbox) {
+  const match = {
+    eventName: { $in: SUB_EVENTS },
+    createdAt: { $gte: from, $lte: to },
+    ...(includeSandbox ? {} : { "params.environment": { $ne: "SANDBOX" } }),
+  };
+
+  const [totalRows, splitRows, activeTrialRows] = await Promise.all([
+    Event.aggregate([
+      { $match: match },
+      {
+        $group: {
+          _id: "$eventName",
+          users: { $addToSet: "$distinctId" },
+          events: { $sum: 1 },
+          revenueUsd: { $sum: "$params.revenue_usd" },
+        },
+      },
+      { $project: { users: { $size: "$users" }, events: 1, revenueUsd: 1 } },
+    ]),
+    Event.aggregate([
+      { $match: match },
+      {
+        $group: {
+          _id: { name: "$eventName", platform: "$platform", plan: "$params.plan" },
+          users: { $addToSet: "$distinctId" },
+          revenueUsd: { $sum: "$params.revenue_usd" },
+        },
+      },
+      { $project: { users: { $size: "$users" }, revenueUsd: 1 } },
+    ]),
+    // Live state, not range-based: trials running right now.
+    User.aggregate([
+      { $match: { premium: true, premiumPeriodType: "TRIAL", premiumExpiresAt: { $gt: new Date() } } },
+      {
+        $group: {
+          _id: { store: "$premiumStore", product: "$premiumProductId", willRenew: "$premiumWillRenew" },
+          count: { $sum: 1 },
+        },
+      },
+    ]),
+  ]);
+
+  const totals = {};
+  SUB_EVENTS.forEach((name) => {
+    totals[name] = { users: 0, events: 0 };
+  });
+  let totalRevenueUsd = 0;
+  totalRows.forEach((r) => {
+    totals[r._id] = { users: r.users, events: r.events };
+    if (REVENUE_EVENTS.includes(r._id)) totalRevenueUsd += r.revenueUsd || 0;
+  });
+
+  // Per-platform and per-plan (monthly/annual) + combined breakdowns of the
+  // trial funnel, with a trial->paid conversion rate for each slice.
+  const slices = { byPlatform: {}, byPlan: {}, byPlatformPlan: {} };
+  const add = (bucket, key, name, users, revenueUsd) => {
+    const slice = (bucket[key] = bucket[key] || { revenueUsd: 0 });
+    slice[name] = (slice[name] || 0) + users;
+    if (REVENUE_EVENTS.includes(name)) slice.revenueUsd += revenueUsd || 0;
+  };
+  splitRows.forEach((r) => {
+    const platform = r._id.platform || "unknown";
+    const plan = r._id.plan || "unknown";
+    add(slices.byPlatform, platform, r._id.name, r.users, r.revenueUsd);
+    add(slices.byPlan, plan, r._id.name, r.users, r.revenueUsd);
+    add(slices.byPlatformPlan, `${platform}:${plan}`, r._id.name, r.users, r.revenueUsd);
+  });
+  // Active trials right now (live state, not range-based), by platform/plan.
+  // willConvert = auto-renew still on; the rest have cancelled and will lapse.
+  const PLATFORM_BY_STORE = { APP_STORE: "ios", MAC_APP_STORE: "ios", PLAY_STORE: "android" };
+  const planOf = (productId) =>
+    /year|annual/i.test(productId || "") ? "annual" : /month/i.test(productId || "") ? "monthly" : "unknown";
+  let activeTrials = 0;
+  let activeTrialsWillConvert = 0;
+  const addActive = (bucket, key, count, willConvert) => {
+    const slice = (bucket[key] = bucket[key] || { revenueUsd: 0 });
+    slice.activeTrials = (slice.activeTrials || 0) + count;
+    if (willConvert) slice.activeTrialsWillConvert = (slice.activeTrialsWillConvert || 0) + count;
+  };
+  activeTrialRows.forEach((r) => {
+    const platform = PLATFORM_BY_STORE[r._id.store] || "unknown";
+    const plan = planOf(r._id.product);
+    const willConvert = r._id.willRenew === true;
+    activeTrials += r.count;
+    if (willConvert) activeTrialsWillConvert += r.count;
+    addActive(slices.byPlatform, platform, r.count, willConvert);
+    addActive(slices.byPlan, plan, r.count, willConvert);
+    addActive(slices.byPlatformPlan, `${platform}:${plan}`, r.count, willConvert);
+  });
+
+  Object.values(slices).forEach((bucket) =>
+    Object.values(bucket).forEach((slice) => {
+      // Every slice always carries every counter so the UI never sees undefined.
+      SUB_EVENTS.forEach((name) => {
+        slice[name] = slice[name] || 0;
+      });
+      slice.activeTrials = slice.activeTrials || 0;
+      slice.activeTrialsWillConvert = slice.activeTrialsWillConvert || 0;
+      slice.trialToPaidRate = pct(slice[EVENTS.SUB_TRIAL_CONVERTED] || 0, slice[EVENTS.SUB_TRIAL_STARTED] || 0);
+      slice.revenueUsd = Math.round(slice.revenueUsd * 100) / 100;
+    })
+  );
+
+  const started = totals[EVENTS.SUB_TRIAL_STARTED].users;
+  const converted = totals[EVENTS.SUB_TRIAL_CONVERTED].users;
+  const expired = totals[EVENTS.SUB_TRIAL_EXPIRED].users;
+
+  return {
+    includesSandbox: includeSandbox,
+    activeTrials,
+    activeTrialsWillConvert,
+    activeTrialsCancelled: activeTrials - activeTrialsWillConvert,
+    totals,
+    rates: {
+      // Of users who started a trial in this range, how many converted in the
+      // same range (understates for trials still running at range end).
+      trialToPaid: pct(converted, started),
+      // Of trials that have actually finished: converted / (converted + expired).
+      trialToPaidResolved: pct(converted, converted + expired),
+    },
+    revenueUsd: Math.round(totalRevenueUsd * 100) / 100,
+    ...slices,
+  };
+}
+
+// GET /api/admin/funnel?secret=...&from=ISO&to=ISO
+// `from`/`to` default to the trailing 30 days. Every count is a unique-user
+// (distinctId) count within the range unless noted otherwise.
+const getFunnelReport = async (req, res) => {
+  if (!isAuthorized(req)) {
+    return res.status(401).json({ success: false, message: "Unauthorized." });
+  }
+
+  try {
+    const { from, to } = parseRange(req);
+    const onboardingSlideNums = Array.from({ length: ONBOARDING_SCREEN_COUNT }, (_, i) => i + 1);
+
+    const topLevelEventNames = [
+      EVENTS.APP_OPEN,
+      EVENTS.ONBOARDING_STARTED,
+      EVENTS.ONBOARDING_COMPLETED,
+      EVENTS.AUTH_SCREEN_REACHED,
+      EVENTS.SIGNUP_STARTED,
+      EVENTS.SIGNUP_COMPLETED,
+      EVENTS.TRANSLATE_SCREEN_OPENED,
+      // audio_selected / translation_* are NOT here: they're counted below
+      // with REAL_ONLY so the sample demo never inflates them.
+      EVENTS.SAMPLE_VOICE_TAPPED,
+      EVENTS.WHATSAPP_TUTORIAL_TAPPED,
+      EVENTS.PAYWALL_VIEWED,
+      EVENTS.PURCHASE_STARTED,
+      EVENTS.PURCHASE_COMPLETED,
+      EVENTS.PURCHASE_FAILED,
+      EVENTS.RESTORE_PURCHASE,
+      EVENTS.TRIAL_STARTED,
+      EVENTS.PLAN_SELECTED,
+      EVENTS.PAYWALL_DISMISSED,
+    ];
+
+    const [
+      topLevelUnique,
+      appOpenTotal,
+      slideViewedByNum,
+      slideCompletedByNum,
+      signupMethodCounts,
+      permShownByType,
+      permGrantedByType,
+      permDeniedByType,
+      productScreensUnique,
+      uploadFailedByType,
+      translationFailedByType,
+      paywallViewedBySource,
+      purchaseFailedByType,
+      retention,
+      audioSelectedByScreen,
+      translationStartedByScreen,
+      translationSucceededByScreen,
+      platformAppOpen,
+      platformTranslationStarted,
+      platformTranslationSucceeded,
+      versionAppOpen,
+      versionTranslationStarted,
+      versionTranslationSucceeded,
+      platformPaywallViewedUsers,
+      platformPaywallViewedEvents,
+      platformPurchaseStarted,
+      platformPurchaseCompleted,
+      platformPurchaseFailed,
+      platformCancelled,
+      dailyTrend,
+      realTranslationUnique,
+      sampleTranslationUnique,
+      translationEventTotals,
+      sampleEventTotals,
+      failedUsers,
+    ] = await Promise.all([
+      uniqueUserCounts(topLevelEventNames, from, to),
+      totalCounts([EVENTS.APP_OPEN], from, to),
+      uniqueUserCountsByParam(EVENTS.ONBOARDING_SLIDE_VIEWED, "slide_number", from, to),
+      uniqueUserCountsByParam(EVENTS.ONBOARDING_SLIDE_COMPLETED, "slide_number", from, to),
+      uniqueUserCountsByParam(EVENTS.SIGNUP_COMPLETED, "method", from, to),
+      totalCountsByParam(EVENTS.PERMISSION_SHOWN, "type", from, to),
+      totalCountsByParam(EVENTS.PERMISSION_GRANTED, "type", from, to),
+      totalCountsByParam(EVENTS.PERMISSION_DENIED, "type", from, to),
+      uniqueUserCountsByParam(EVENTS.SCREEN_REACHED, "screen", from, to),
+      // Event counts (not unique users) so the failure total equals the number
+      // of failed requests, matching translationEvents.failed below.
+      totalCountsByParam(EVENTS.AUDIO_UPLOAD_FAILED, "error_type", from, to),
+      totalCountsByParam(EVENTS.TRANSLATION_FAILED, "error_type", from, to),
+      uniqueUserCountsByParam(EVENTS.PAYWALL_VIEWED, "source", from, to),
+      uniqueUserCountsByParam(EVENTS.PURCHASE_FAILED, "error_type", from, to),
+      computeRetention(from, to),
+      // Record tab's pipeline calls always pass screen: "mic" (see
+      // useTranslateFlow2.js) — distinct from the Translate tab's "translate".
+      uniqueUserCountsByParam(EVENTS.AUDIO_SELECTED, "screen", from, to, REAL_ONLY),
+      uniqueUserCountsByParam(EVENTS.TRANSLATION_STARTED, "screen", from, to, REAL_ONLY),
+      uniqueUserCountsByParam(EVENTS.TRANSLATION_SUCCEEDED, "screen", from, to, REAL_ONLY),
+      uniqueUserCountsByField(EVENTS.APP_OPEN, "platform", from, to),
+      uniqueUserCountsByField(EVENTS.TRANSLATION_STARTED, "platform", from, to, REAL_ONLY),
+      uniqueUserCountsByField(EVENTS.TRANSLATION_SUCCEEDED, "platform", from, to, REAL_ONLY),
+      uniqueUserCountsByField(EVENTS.APP_OPEN, "appVersion", from, to),
+      uniqueUserCountsByField(EVENTS.TRANSLATION_STARTED, "appVersion", from, to, REAL_ONLY),
+      uniqueUserCountsByField(EVENTS.TRANSLATION_SUCCEEDED, "appVersion", from, to, REAL_ONLY),
+      uniqueUserCountsByField(EVENTS.PAYWALL_VIEWED, "platform", from, to),
+      totalCountsByField(EVENTS.PAYWALL_VIEWED, "platform", from, to),
+      uniqueUserCountsByField(EVENTS.PURCHASE_STARTED, "platform", from, to),
+      uniqueUserCountsByField(EVENTS.PURCHASE_COMPLETED, "platform", from, to),
+      uniqueUserCountsByField(EVENTS.PURCHASE_FAILED, "platform", from, to),
+      uniqueUserCountsByFieldAndParamValue(EVENTS.PURCHASE_FAILED, "platform", "error_type", "user_cancelled", from, to),
+      computeDailyTrend(from, to),
+      // Real translations only (sample demo excluded) — unique users per step.
+      uniqueUserCounts(
+        [
+          EVENTS.AUDIO_SELECTED,
+          EVENTS.TRANSLATION_STARTED,
+          EVENTS.TRANSLATION_SUCCEEDED,
+          EVENTS.TRANSLATION_FAILED,
+        ],
+        from,
+        to,
+        REAL_ONLY,
+      ),
+      uniqueUserCounts([EVENTS.TRANSLATION_SUCCEEDED], from, to, SAMPLE_ONLY),
+      // Real translations — raw event counts. A failed request fires exactly
+      // one of translation_failed / audio_upload_failed (see pipeline.js), so
+      // their sum is the failed-request count.
+      totalCounts(
+        [
+          EVENTS.TRANSLATION_STARTED,
+          EVENTS.TRANSLATION_SUCCEEDED,
+          EVENTS.TRANSLATION_FAILED,
+          EVENTS.AUDIO_UPLOAD_FAILED,
+        ],
+        from,
+        to,
+        REAL_ONLY,
+      ),
+      totalCounts([EVENTS.TRANSLATION_SUCCEEDED], from, to, SAMPLE_ONLY),
+      uniqueUsersAcross([EVENTS.TRANSLATION_FAILED, EVENTS.AUDIO_UPLOAD_FAILED], from, to),
+    ]);
+
+    // Replace the translation-related unique-user counts with the real-only
+    // versions (these keys were deliberately left out of topLevelEventNames).
+    Object.assign(topLevelUnique, realTranslationUnique);
+
+    const translationAttempts = translationEventTotals[EVENTS.TRANSLATION_STARTED];
+    const translationSuccesses = translationEventTotals[EVENTS.TRANSLATION_SUCCEEDED];
+    const translationFailures =
+      translationEventTotals[EVENTS.TRANSLATION_FAILED] +
+      translationEventTotals[EVENTS.AUDIO_UPLOAD_FAILED];
+    const translationEvents = {
+      attempts: translationAttempts,
+      succeeded: translationSuccesses,
+      failed: translationFailures,
+      // Attempts that ended with neither success nor failure: blocked by the
+      // free limit, or the app was closed mid-request.
+      noOutcome: Math.max(0, translationAttempts - translationSuccesses - translationFailures),
+      // Of requests that finished (succeeded or failed) — free-limit blocks
+      // aren't failures, so they don't drag this down.
+      successRate: pct(translationSuccesses, translationSuccesses + translationFailures),
+      // The in-app sample demo, reported separately and never mixed in above.
+      sampleRuns: sampleEventTotals[EVENTS.TRANSLATION_SUCCEEDED],
+      sampleUsers: sampleTranslationUnique[EVENTS.TRANSLATION_SUCCEEDED],
+    };
+
+    const appOpenUnique = topLevelUnique[EVENTS.APP_OPEN];
+
+    // First-time vs returning opens: compare each opener's very first-ever
+    // app_open (all time) against this range.
+    const firstOpenRows = await Event.aggregate([
+      { $match: { eventName: EVENTS.APP_OPEN } },
+      { $group: { _id: "$distinctId", firstOpenAt: { $min: "$createdAt" } } },
+    ]);
+    const firstOpenMap = new Map(firstOpenRows.map((r) => [r._id, r.firstOpenAt]));
+    const openersInRange = await Event.aggregate([
+      { $match: { eventName: EVENTS.APP_OPEN, createdAt: { $gte: from, $lte: to } } },
+      { $group: { _id: "$distinctId" } },
+    ]);
+    let firstTimeUsers = 0;
+    openersInRange.forEach((r) => {
+      const firstOpen = firstOpenMap.get(r._id);
+      if (firstOpen && firstOpen >= from && firstOpen <= to) firstTimeUsers += 1;
+    });
+    const returningUsers = openersInRange.length - firstTimeUsers;
+
+    const subscriptions = await computeSubscriptionStats(from, to, req.query.includeSandbox === "true");
+
+    const failureBreakdown = {};
+    ERROR_TYPES.forEach((type) => {
+      failureBreakdown[type] = (uploadFailedByType[type] || 0) + (translationFailedByType[type] || 0);
+    });
+
+    const onboardingDropOff = {};
+    onboardingSlideNums.forEach((n) => {
+      const reached = slideViewedByNum[String(n)] || 0;
+      const completed = slideCompletedByNum[String(n)] || 0;
+      onboardingDropOff[`slide_${n}`] = {
+        reached,
+        reachedPct: pct(reached, appOpenUnique),
+        completed,
+        completedPct: pct(completed, appOpenUnique),
+      };
+    });
+
+    const recordScreenReached = productScreensUnique["record"] || 0;
+    const recordAudioSelected = audioSelectedByScreen["mic"] || 0;
+    const recordTranslationStarted = translationStartedByScreen["mic"] || 0;
+    const recordTranslationSucceeded = translationSucceededByScreen["mic"] || 0;
+    const recordUsage = {
+      reached: recordScreenReached,
+      reachedPct: pct(recordScreenReached, appOpenUnique),
+      audioSelected: recordAudioSelected,
+      audioSelectedPct: pct(recordAudioSelected, recordScreenReached),
+      translationStarted: recordTranslationStarted,
+      translationSucceeded: recordTranslationSucceeded,
+      successRate: pct(recordTranslationSucceeded, recordTranslationStarted),
+    };
+
+    const platformBreakdown = mergeBreakdown(
+      platformAppOpen,
+      platformTranslationStarted,
+      platformTranslationSucceeded,
+    );
+    const versionBreakdown = mergeBreakdown(
+      versionAppOpen,
+      versionTranslationStarted,
+      versionTranslationSucceeded,
+    );
+
+    // Platform-segmented monetization — same unique-user-count convention as
+    // the rest of `monetization` below, except paywallViewed which also
+    // exposes a raw event count (users can view the paywall more than once).
+    // "purchaseStarted" covers BOTH "tapped a plan" and "checkout started":
+    // with current mobile instrumentation these are the same purchase_started
+    // event (see PaywallScreen.js handlePurchase) — there is no separate
+    // "selected a plan card" event, so they cannot be split without a new
+    // mobile-side event. Treated as one merged metric here by design.
+    const platformMonetizationKeys = new Set([
+      ...Object.keys(platformAppOpen),
+      ...Object.keys(platformPaywallViewedUsers),
+      ...Object.keys(platformPurchaseStarted),
+      ...Object.keys(platformPurchaseCompleted),
+      ...Object.keys(platformPurchaseFailed),
+      ...Object.keys(platformCancelled),
+    ]);
+    const monetizationByPlatform = {};
+    platformMonetizationKeys.forEach((key) => {
+      const paywallViewedUsers = platformPaywallViewedUsers[key] || 0;
+      const purchaseCompletedUsers = platformPurchaseCompleted[key] || 0;
+      monetizationByPlatform[key] = {
+        users: platformAppOpen[key] || 0,
+        paywallViewedUsers,
+        paywallViewedEvents: platformPaywallViewedEvents[key] || 0,
+        purchaseStartedUsers: platformPurchaseStarted[key] || 0,
+        purchaseCompletedUsers,
+        purchaseFailedUsers: platformPurchaseFailed[key] || 0,
+        cancelledUsers: platformCancelled[key] || 0,
+        conversionRate: pct(purchaseCompletedUsers, paywallViewedUsers),
+      };
+    });
+
+    const coreSuccessFunnel = [
+      { key: "app_opened", label: "App opened", count: appOpenUnique },
+      { key: "onboarding_started", label: "Onboarding started", count: topLevelUnique[EVENTS.ONBOARDING_STARTED] },
+      { key: "onboarding_completed", label: "Onboarding completed", count: topLevelUnique[EVENTS.ONBOARDING_COMPLETED] },
+      { key: "signup_started", label: "Signup started", count: topLevelUnique[EVENTS.SIGNUP_STARTED] },
+      { key: "signup_completed", label: "Signup completed", count: topLevelUnique[EVENTS.SIGNUP_COMPLETED] },
+      { key: "translate_reached", label: "Translate screen reached", count: topLevelUnique[EVENTS.TRANSLATE_SCREEN_OPENED] },
+      { key: "audio_selected", label: "Audio selected/uploaded", count: topLevelUnique[EVENTS.AUDIO_SELECTED] },
+      { key: "translation_started", label: "Translation started", count: topLevelUnique[EVENTS.TRANSLATION_STARTED] },
+      { key: "translation_succeeded", label: "Translation succeeded", count: topLevelUnique[EVENTS.TRANSLATION_SUCCEEDED] },
+    ].map((step) => ({ ...step, pctOfAppOpens: pct(step.count, appOpenUnique) }));
+
+    res.status(200).json({
+      success: true,
+      range: { from, to },
+      totals: {
+        appOpened: appOpenUnique,
+        appOpensTotal: appOpenTotal[EVENTS.APP_OPEN],
+        firstTimeOpens: firstTimeUsers,
+        returningOpens: returningUsers,
+        onboardingStarted: topLevelUnique[EVENTS.ONBOARDING_STARTED],
+        onboardingCompleted: topLevelUnique[EVENTS.ONBOARDING_COMPLETED],
+        signupStarted: topLevelUnique[EVENTS.SIGNUP_STARTED],
+        signupCompleted: topLevelUnique[EVENTS.SIGNUP_COMPLETED],
+      },
+      onboardingDropOff,
+      onboardingCompletionRate: pct(topLevelUnique[EVENTS.ONBOARDING_COMPLETED], appOpenUnique),
+      signup: {
+        reached: topLevelUnique[EVENTS.AUTH_SCREEN_REACHED],
+        completed: topLevelUnique[EVENTS.SIGNUP_COMPLETED],
+        completionRate: pct(topLevelUnique[EVENTS.SIGNUP_COMPLETED], topLevelUnique[EVENTS.AUTH_SCREEN_REACHED]),
+        byMethod: Object.fromEntries(
+          Object.entries(signupMethodCounts).map(([method, count]) => [
+            method,
+            { count, pct: pct(count, topLevelUnique[EVENTS.SIGNUP_COMPLETED]) },
+          ])
+        ),
+      },
+      permissions: ["microphone", "notification"].reduce((acc, type) => {
+        const shown = permShownByType[type] || 0;
+        const granted = permGrantedByType[type] || 0;
+        const denied = permDeniedByType[type] || 0;
+        acc[type] = {
+          shown,
+          granted,
+          grantedPct: pct(granted, shown),
+          denied,
+          deniedPct: pct(denied, shown),
+        };
+        return acc;
+      }, {}),
+      coreProduct: {
+        translateScreenReached: topLevelUnique[EVENTS.TRANSLATE_SCREEN_OPENED],
+        audioSelected: topLevelUnique[EVENTS.AUDIO_SELECTED],
+        translationAttempted: topLevelUnique[EVENTS.TRANSLATION_STARTED],
+        translationSucceeded: topLevelUnique[EVENTS.TRANSLATION_SUCCEEDED],
+        // Users with any failed request (translation OR upload stage).
+        translationFailed: failedUsers,
+        // Real translations as event counts + the separate sample-demo tally.
+        translationEvents,
+        screensReached: PRODUCT_SCREENS.reduce((acc, screen) => {
+          acc[screen] = productScreensUnique[screen] || 0;
+          return acc;
+        }, {}),
+      },
+      // How the empty-state on the (previously dead-on-arrival) Translate
+      // screen is actually used — added alongside the sample-audio button
+      // and promoted WhatsApp tutorial card.
+      translateScreenEngagement: {
+        screenReached: topLevelUnique[EVENTS.TRANSLATE_SCREEN_OPENED],
+        sampleTapped: topLevelUnique[EVENTS.SAMPLE_VOICE_TAPPED],
+        sampleTappedPct: pct(topLevelUnique[EVENTS.SAMPLE_VOICE_TAPPED], topLevelUnique[EVENTS.TRANSLATE_SCREEN_OPENED]),
+        tutorialTapped: topLevelUnique[EVENTS.WHATSAPP_TUTORIAL_TAPPED],
+        tutorialTappedPct: pct(topLevelUnique[EVENTS.WHATSAPP_TUTORIAL_TAPPED], topLevelUnique[EVENTS.TRANSLATE_SCREEN_OPENED]),
+      },
+      // Paywall funnel — how many people see it (and from where: the hard
+      // free-limit block, the credits chip, or the new second-translation
+      // nudge), how many tap into a purchase, and how many actually buy.
+      monetization: {
+        paywallViewed: topLevelUnique[EVENTS.PAYWALL_VIEWED],
+        purchaseStarted: topLevelUnique[EVENTS.PURCHASE_STARTED],
+        purchaseCompleted: topLevelUnique[EVENTS.PURCHASE_COMPLETED],
+        purchaseFailed: topLevelUnique[EVENTS.PURCHASE_FAILED],
+        restorePurchase: topLevelUnique[EVENTS.RESTORE_PURCHASE],
+        // Client-side trial starts (paywall -> trial). NOT included in
+        // purchaseCompleted / conversionRate above, which are paid-only now.
+        trialStarted: topLevelUnique[EVENTS.TRIAL_STARTED],
+        planSelected: topLevelUnique[EVENTS.PLAN_SELECTED],
+        paywallDismissed: topLevelUnique[EVENTS.PAYWALL_DISMISSED],
+        trialConversionRate: pct(topLevelUnique[EVENTS.TRIAL_STARTED], topLevelUnique[EVENTS.PAYWALL_VIEWED]),
+        clickThroughRate: pct(topLevelUnique[EVENTS.PURCHASE_STARTED], topLevelUnique[EVENTS.PAYWALL_VIEWED]),
+        conversionRate: pct(topLevelUnique[EVENTS.PURCHASE_COMPLETED], topLevelUnique[EVENTS.PAYWALL_VIEWED]),
+        purchaseSuccessRate: pct(topLevelUnique[EVENTS.PURCHASE_COMPLETED], topLevelUnique[EVENTS.PURCHASE_STARTED]),
+        viewsBySource: Object.fromEntries(
+          Object.entries(paywallViewedBySource).map(([source, count]) => [
+            source,
+            { count, pct: pct(count, topLevelUnique[EVENTS.PAYWALL_VIEWED]) },
+          ])
+        ),
+        failuresByType: Object.fromEntries(
+          Object.entries(purchaseFailedByType).map(([type, count]) => [
+            type,
+            { count, pct: pct(count, topLevelUnique[EVENTS.PURCHASE_FAILED]) },
+          ])
+        ),
+      },
+      // Authoritative trial/subscription lifecycle + revenue (from the RevenueCat webhook).
+      subscriptions,
+      failureBreakdown,
+      coreSuccessFunnel,
+      recordUsage,
+      platformBreakdown,
+      versionBreakdown,
+      monetizationByPlatform,
+      dailyTrend,
+      retention,
+    });
+  } catch (error) {
+    console.error("[admin] Funnel report failed:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// GET /api/admin/traffic?secret=...&from=...&to=...
+// Website acquisition: where visitors came from (utm_source / referrer,
+// classified client-side into params.channel) and how many of them clicked
+// through to an app store. Website events share the Event collection but use
+// their own event names, so the app funnel/retention queries never see them.
+const getTrafficReport = async (req, res) => {
+  if (!isAuthorized(req)) {
+    return res.status(401).json({ success: false, message: "Unauthorized." });
+  }
+
+  try {
+    const { from, to } = parseRange(req);
+
+    const [
+      totals,
+      totalEvents,
+      visitorsByChannel,
+      visitsByChannel,
+      clickersByChannel,
+      clicksByChannel,
+      visitorsByLanding,
+      visitsBySource,
+      clicksByStore,
+    ] = await Promise.all([
+      uniqueUserCounts([EVENTS.WEB_VISIT, EVENTS.STORE_CLICK], from, to),
+      totalCounts([EVENTS.WEB_VISIT, EVENTS.STORE_CLICK], from, to),
+      uniqueUserCountsByParam(EVENTS.WEB_VISIT, "channel", from, to),
+      totalCountsByParam(EVENTS.WEB_VISIT, "channel", from, to),
+      uniqueUserCountsByParam(EVENTS.STORE_CLICK, "channel", from, to),
+      totalCountsByParam(EVENTS.STORE_CLICK, "channel", from, to),
+      uniqueUserCountsByParam(EVENTS.WEB_VISIT, "landing_page", from, to),
+      totalCountsByParam(EVENTS.WEB_VISIT, "source", from, to),
+      totalCountsByParam(EVENTS.STORE_CLICK, "store", from, to),
+    ]);
+
+    const channelKeys = new Set([...Object.keys(visitorsByChannel), ...Object.keys(clickersByChannel)]);
+    const channels = {};
+    channelKeys.forEach((key) => {
+      const visitors = visitorsByChannel[key] || 0;
+      const storeClickers = clickersByChannel[key] || 0;
+      channels[key] = {
+        visitors,
+        visits: visitsByChannel[key] || 0,
+        storeClickers,
+        storeClicks: clicksByChannel[key] || 0,
+        clickRate: pct(storeClickers, visitors),
+        visitorsPct: pct(visitors, totals[EVENTS.WEB_VISIT]),
+      };
+    });
+
+    res.json({
+      success: true,
+      range: { from, to },
+      totals: {
+        visitors: totals[EVENTS.WEB_VISIT],
+        visits: totalEvents[EVENTS.WEB_VISIT],
+        storeClickers: totals[EVENTS.STORE_CLICK],
+        storeClicks: totalEvents[EVENTS.STORE_CLICK],
+        clickRate: pct(totals[EVENTS.STORE_CLICK], totals[EVENTS.WEB_VISIT]),
+      },
+      channels,
+      landingPages: Object.fromEntries(
+        Object.entries(visitorsByLanding).map(([page, count]) => [
+          page,
+          { count, pct: pct(count, totals[EVENTS.WEB_VISIT]) },
+        ])
+      ),
+      // Raw utm_source / referrer-host values behind the channels — useful to
+      // spot a new AI referrer that isn't classified yet (lands in "other").
+      sources: visitsBySource,
+      storeClicksByStore: clicksByStore,
+    });
+  } catch (error) {
+    console.error("[admin] Traffic report failed:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// GET /api/admin/notification-audience?secret=...
+const getNotificationAudience = async (req, res) => {
+  if (!isAuthorized(req)) {
+    return res.status(401).json({ success: false, message: "Unauthorized." });
+  }
+  try {
+    res.json({ success: true, counts: await getPushAudienceCounts() });
+  } catch (error) {
+    console.error("[admin] Notification audience failed:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// POST /api/admin/send-notification?secret=...
+// Body: { platform: "android" | "ios" | "all", title, body }
+// Admin-dashboard broadcast (sale announcements etc.) — same Expo delivery
+// as /api/notifications/announcement, plus the platform filter.
+const sendNotification = async (req, res) => {
+  if (!isAuthorized(req)) {
+    return res.status(401).json({ success: false, message: "Unauthorized." });
+  }
+
+  const { platform, title, body } = req.body || {};
+  if (!PUSH_PLATFORMS.includes(platform)) {
+    return res.status(400).json({ success: false, message: "platform must be android, ios or all." });
+  }
+  if (typeof title !== "string" || typeof body !== "string" || !title.trim() || !body.trim()) {
+    return res.status(400).json({ success: false, message: "title and body are required." });
+  }
+  if (title.length > 65 || body.length > 240) {
+    return res.status(400).json({ success: false, message: "Title max 65 chars, body max 240." });
+  }
+
+  try {
+    const result = await sendAnnouncementPushToAllUsers({
+      title: title.trim(),
+      body: body.trim(),
+      platform,
+    });
+    console.log(`[admin] Broadcast (${platform}) "${title.trim()}":`, {
+      targets: result.totalTargetUsers,
+      tickets: result.totalTickets,
+      errors: result.totalTicketErrors,
+    });
+    // ticketErrors can be huge and carries uids — keep the response compact.
+    const { ticketErrors, ...summary } = result;
+    res.json({ success: true, platform, ...summary });
+  } catch (error) {
+    console.error("[admin] Send notification failed:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// GET /api/admin/user-journey?secret=...&distinctId=...  (or &uid=...)
+// Full chronological event list for one user, plus the per-user retention
+// summary fields (first_seen_at, last_seen_at, translation attempt/success
+// counts) — for debugging exactly where one person's journey diverged.
+const getUserJourney = async (req, res) => {
+  if (!isAuthorized(req)) {
+    return res.status(401).json({ success: false, message: "Unauthorized." });
+  }
+
+  const { distinctId, uid } = req.query;
+  if (!distinctId && !uid) {
+    return res.status(400).json({ success: false, message: "distinctId or uid query param is required." });
+  }
+
+  try {
+    const filter = distinctId ? { distinctId } : { uid };
+    const events = await Event.find(filter).sort({ createdAt: 1 }).lean();
+
+    if (events.length === 0) {
+      return res.status(200).json({ success: true, summary: null, events: [] });
+    }
+
+    const appOpens = events.filter((e) => e.eventName === EVENTS.APP_OPEN);
+    // Real translations only — the sample demo isn't an attempt/success.
+    const isSample = (e) => e.params?.source === "sample";
+    const translationAttempts = events.filter(
+      (e) => e.eventName === EVENTS.TRANSLATION_STARTED && !isSample(e),
+    );
+    const translationSuccesses = events.filter(
+      (e) => e.eventName === EVENTS.TRANSLATION_SUCCEEDED && !isSample(e),
+    );
+
+    const summary = {
+      distinctId: events[0].distinctId,
+      uid: events.find((e) => e.uid)?.uid || null,
+      firstSeenAt: events[0].createdAt,
+      lastSeenAt: events[events.length - 1].createdAt,
+      appOpens: appOpens.length,
+      translationAttempts: translationAttempts.length,
+      translationSuccesses: translationSuccesses.length,
+      lastSuccessfulTranslationAt:
+        translationSuccesses.length > 0
+          ? translationSuccesses[translationSuccesses.length - 1].createdAt
+          : null,
+    };
+
+    res.status(200).json({
+      success: true,
+      summary,
+      events: events.map((e) => ({
+        name: e.eventName,
+        params: e.params,
+        platform: e.platform,
+        uid: e.uid,
+        at: e.createdAt,
+      })),
+    });
+  } catch (error) {
+    console.error("[admin] User journey lookup failed:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+const AI_PROVIDERS = ["whisper", "openai", "google_tts", "elevenlabs"];
+
+function isValidTimezone(tz) {
+  if (typeof tz !== "string") return false;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// en-CA formats as YYYY-MM-DD, matching Mongo's $dateToString below.
+function dayKey(date, tz) {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(date);
+}
+
+// GET /api/admin/ai-usage?secret=&days=14&tz=Asia/Kolkata
+// Per-day call counts per AI provider (Whisper / OpenAI / Google TTS /
+// ElevenLabs), bucketed in the caller's timezone so "today" matches their
+// wall clock. Counts every provider call including failed ones (still
+// attempted/billed); `failed` is reported separately.
+const getAiUsageReport = async (req, res) => {
+  if (!isAuthorized(req)) {
+    return res.status(401).json({ success: false, message: "Unauthorized." });
+  }
+
+  try {
+    const tz = isValidTimezone(req.query.tz) ? req.query.tz : "UTC";
+    const days = Math.min(Math.max(parseInt(req.query.days, 10) || 14, 1), 90);
+    const since = new Date(Date.now() - (days + 1) * DAY_MS);
+
+    const rows = await AiCallLog.aggregate([
+      { $match: { createdAt: { $gte: since } } },
+      {
+        $group: {
+          _id: {
+            day: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: tz } },
+            provider: "$provider",
+          },
+          count: { $sum: 1 },
+          failed: { $sum: { $cond: ["$success", 0, 1] } },
+        },
+      },
+    ]);
+
+    const emptyCounts = () => Object.fromEntries(AI_PROVIDERS.map((p) => [p, 0]));
+    const byDay = {};
+    for (let i = 0; i < days; i++) {
+      byDay[dayKey(new Date(Date.now() - i * DAY_MS), tz)] = {
+        counts: emptyCounts(),
+        failed: emptyCounts(),
+      };
+    }
+    rows.forEach((r) => {
+      const bucket = byDay[r._id.day];
+      if (!bucket || !AI_PROVIDERS.includes(r._id.provider)) return;
+      bucket.counts[r._id.provider] = r.count;
+      bucket.failed[r._id.provider] = r.failed;
+    });
+
+    const daily = Object.entries(byDay)
+      .map(([date, v]) => ({ date, ...v }))
+      .sort((a, b) => (a.date < b.date ? 1 : -1)); // newest first
+
+    const sumDays = (list) => {
+      const total = emptyCounts();
+      list.forEach((d) => AI_PROVIDERS.forEach((p) => (total[p] += d.counts[p])));
+      return total;
+    };
+
+    return res.json({
+      success: true,
+      timezone: tz,
+      today: daily[0]?.counts ?? emptyCounts(),
+      yesterday: daily[1]?.counts ?? emptyCounts(),
+      last7Days: sumDays(daily.slice(0, 7)),
+      daily,
+    });
+  } catch (error) {
+    console.error("AI usage report failed:", error);
+    return res.status(500).json({ success: false, message: "Failed to build AI usage report." });
+  }
+};
+
+// GET /api/admin/purchase-survey?secret=...&from=ISO&to=ISO
+// "Why are people who start checkout not paying?" — answers to the
+// post-purchase-abandonment survey (PurchaseSurvey collection), plus how often
+// the survey was shown/skipped (from the Event log). Kept entirely separate
+// from the translation/funnel report.
+const getPurchaseSurveyReport = async (req, res) => {
+  if (!isAuthorized(req)) {
+    return res.status(401).json({ success: false, message: "Unauthorized." });
+  }
+
+  try {
+    const { from, to } = parseRange(req);
+    const range = { createdAt: { $gte: from, $lte: to } };
+
+    const groupCount = async (field) => {
+      const rows = await PurchaseSurvey.aggregate([
+        { $match: range },
+        { $group: { _id: `$${field}`, count: { $sum: 1 } } },
+      ]);
+      return Object.fromEntries(rows.map((r) => [r._id === null ? "unknown" : String(r._id), r.count]));
+    };
+
+    const [
+      total,
+      withFeedback,
+      byReasonRaw,
+      byPlatformRaw,
+      byPlanRaw,
+      byUseCaseRaw,
+      reasonByPlatformRows,
+      recent,
+      surveyEvents,
+    ] = await Promise.all([
+      PurchaseSurvey.countDocuments(range),
+      PurchaseSurvey.countDocuments({ ...range, feedback: { $ne: "" } }),
+      groupCount("reason"),
+      groupCount("platform"),
+      groupCount("plan"),
+      groupCount("useCase"),
+      PurchaseSurvey.aggregate([
+        { $match: range },
+        { $group: { _id: { platform: "$platform", reason: "$reason" }, count: { $sum: 1 } } },
+      ]),
+      PurchaseSurvey.find({ ...range, feedback: { $ne: "" } })
+        .sort({ createdAt: -1 })
+        .limit(50)
+        .select("feedback reason useCase platform plan appVersion createdAt -_id")
+        .lean(),
+      totalCounts(
+        [
+          EVENTS.PURCHASE_SURVEY_SHOWN,
+          EVENTS.PURCHASE_SURVEY_SUBMITTED,
+          EVENTS.PURCHASE_SURVEY_SKIPPED,
+        ],
+        from,
+        to,
+      ),
+    ]);
+
+    // Every known answer is listed (even at 0) so the report shape is stable;
+    // anything unexpected is kept under its own key rather than dropped.
+    const withPct = (raw, knownKeys, denominator) => {
+      const keys = [...knownKeys, ...Object.keys(raw).filter((k) => !knownKeys.includes(k))];
+      return Object.fromEntries(
+        keys.map((key) => [key, { count: raw[key] || 0, pct: pct(raw[key] || 0, denominator) }]),
+      );
+    };
+
+    const answeredUseCase = total - (byUseCaseRaw.unknown || 0);
+    const reasonByPlatform = {};
+    reasonByPlatformRows.forEach((r) => {
+      const { platform, reason } = r._id;
+      if (!reasonByPlatform[platform]) reasonByPlatform[platform] = {};
+      reasonByPlatform[platform][reason] = r.count;
+    });
+
+    const shown = surveyEvents[EVENTS.PURCHASE_SURVEY_SHOWN];
+
+    return res.status(200).json({
+      success: true,
+      range: { from, to },
+      totals: {
+        responses: total,
+        withFeedback,
+        // How many of the people shown the survey answered it.
+        shown,
+        submitted: surveyEvents[EVENTS.PURCHASE_SURVEY_SUBMITTED],
+        skipped: surveyEvents[EVENTS.PURCHASE_SURVEY_SKIPPED],
+        // Capped: answers from before the shown-event existed can outnumber it.
+        responseRate: Math.min(100, pct(total, shown)),
+      },
+      byReason: withPct(byReasonRaw, SURVEY_REASONS, total),
+      byPlatform: withPct(byPlatformRaw, SURVEY_PLATFORMS, total),
+      byPlan: withPct(byPlanRaw, ["annual", "monthly"], total),
+      // Use case is optional, so its percentages are of those who answered it.
+      byUseCase: withPct(
+        Object.fromEntries(Object.entries(byUseCaseRaw).filter(([k]) => k !== "unknown")),
+        SURVEY_USE_CASES,
+        answeredUseCase,
+      ),
+      useCaseAnswered: answeredUseCase,
+      reasonByPlatform,
+      recentFeedback: recent.map((r) => ({
+        text: r.feedback,
+        reason: r.reason,
+        useCase: r.useCase || null,
+        platform: r.platform,
+        plan: r.plan || null,
+        appVersion: r.appVersion || null,
+        at: r.createdAt,
+      })),
+    });
+  } catch (error) {
+    console.error("[admin] Purchase survey report failed:", error);
+    return res.status(500).json({ success: false, message: "Failed to build purchase survey report." });
+  }
+};
+
+export { getFunnelReport, getUserJourney, getAiUsageReport, getTrafficReport, getNotificationAudience, sendNotification, getPurchaseSurveyReport };
