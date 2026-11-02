@@ -1,6 +1,6 @@
 import { generateTranslatedSpeech } from "./tts.service.js";
 import { translateText } from "./openai.service.js";
-import { CODE_TO_NAME } from "../config/voiceCatalog.js";
+import { CODE_TO_NAME, hasVoice } from "../config/voiceCatalog.js";
 import VoicePreview from "../models/VoicePreview.js";
 
 // Lightweight sample line for Settings -> voice preview. Deliberately does
@@ -16,6 +16,8 @@ const pendingPreviewPromises = new Map();
 
 export async function getVoicePreviewBuffer(languageCode, voiceId) {
   const code = languageCode && CODE_TO_NAME[languageCode] ? languageCode : PREVIEW_SOURCE_LANGUAGE_CODE;
+  // Text-only languages have no voice to preview: skip the (paid) GPT translation too.
+  if (!hasVoice(code)) return null;
   const cacheKey = `${code}_${voiceId}`;
 
   if (cachedPreviewBuffers.has(cacheKey)) {

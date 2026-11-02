@@ -1,16 +1,19 @@
 import { generateSpeech as generateSpeechGoogle } from "./googleTts.service.js";
-import { generateSpeech as generateSpeechElevenLabs } from "./elevenlabs.service.js";
 import { resolveVoice } from "../config/voiceCatalog.js";
 
 /**
  * Single entry point the rest of the backend calls for TTS. Routes to Google
- * Cloud TTS for every language it covers, and silently falls back to
- * ElevenLabs for the 3 languages (fa/zu/ga) Google has no voice for at all —
- * no UI/analytics indication of which provider actually generated the audio.
+ * Cloud TTS for every language it covers. Languages Google has no voice for
+ * ("Text reply only" languages, tts:"none" in config/languages.js) get NO audio
+ * call at all: this returns null immediately.
  *
- * Returns a Buffer, or null if audio can't be produced (ElevenLabs fallback
- * failing, or Google TTS still failing after one retry) — callers treat null
- * as "text-only, no audio", never as an error to surface.
+ * ElevenLabs is not part of this pipeline unless ELEVENLABS_ENABLED=true (see
+ * config/ttsProviders.js, off by default); only then do fa/zu/ga use it. It is
+ * imported lazily so the module is never even loaded while the flag is off.
+ *
+ * Returns a Buffer, or null if audio can't be produced (text-only language, or
+ * the provider failing after a retry) - callers treat null as "text-only, no
+ * audio", never as an error to surface.
  */
 export const generateTranslatedSpeech = async (
   text,
@@ -20,8 +23,13 @@ export const generateTranslatedSpeech = async (
 ) => {
   const resolved = resolveVoice(targetLanguageCode, targetLanguageName, voiceId);
 
+  if (resolved.provider === "none") {
+    return null;
+  }
+
   if (resolved.provider === "elevenlabs") {
     try {
+      const { generateSpeech: generateSpeechElevenLabs } = await import("./elevenlabs.service.js");
       return await generateSpeechElevenLabs(text, resolved.voiceId);
     } catch (error) {
       console.error(
@@ -33,7 +41,7 @@ export const generateTranslatedSpeech = async (
   }
 
   // Google TTS: retry once (most failures are transient), then degrade to
-  // text-only rather than failing the whole request — by this point Whisper
+  // text-only rather than failing the whole request - by this point Whisper
   // and the translation already succeeded and the user can still read them.
   // Each attempt is logged separately in AiCallLog, so failures stay visible.
   for (let attempt = 1; attempt <= 2; attempt += 1) {

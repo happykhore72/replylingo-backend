@@ -1,25 +1,9 @@
-// Google Cloud TTS voice/language mapping, keyed by the SAME 2-letter codes
-// used by the mobile app's src/utils/languages.js (LANGUAGES[].code) — this
-// is deliberately not a second/conflicting language list, just a voice
-// lookup table over the existing language codes.
+// Google Cloud TTS voice/language mapping. The language list lives in
+// ./languages.js; this file derives the voice lookup tables from it (see the
+// tier notes further down) and holds the 8 voice personas.
 //
 // Coverage was verified live against the real Google Cloud TTS API
-// (client.listVoices({}) — 2066 voices across 63 language codes) rather than
-// assumed. Three tiers:
-//
-//  1. "chirp3hd" (40 languages) — the 8 universal natural-sounding personas
-//     below exist in every one of these locales under the exact same name
-//     (e.g. de-DE-Chirp3-HD-Kore, hi-IN-Chirp3-HD-Kore, ja-JP-Chirp3-HD-Kore).
-//  2. "override" (7 languages) — only Wavenet/Standard tier is available,
-//     with fewer distinct voices per language than the 4 female + 4 male
-//     persona slots. Some (af, ca, eu, is) have ONLY a single female voice
-//     and NO male voice at all — a male request there gracefully falls back
-//     to that same female voice rather than erroring.
-//  3. "elevenlabs" (3 languages: fa, zu, ga) — Google Cloud TTS has NO voice
-//     at all for these. Falls back to the existing ElevenLabs integration,
-//     silently (no UI/analytics indication of provider). If ElevenLabs also
-//     fails (it doesn't officially support these either), the caller
-//     degrades to text-only — see services/tts.service.js.
+// (client.listVoices({}) - 2066 voices across 63 locales) rather than assumed.
 
 // The 8 voice ids the mobile app exposes in src/utils/voices.js. Keep these
 // two files in sync — same ids, same order.
@@ -54,218 +38,102 @@ export function isValidVoiceId(voiceId) {
   return Boolean(voiceId && (VOICE_PERSONAS[voiceId] || LEGACY_VOICE_ID_MAP[voiceId]));
 }
 
-function chirp3hd(locale) {
-  return { tier: "chirp3hd", locale };
-}
+// The language list itself now lives in ./languages.js (one row per language,
+// also served to the app by GET /api/languages). This file only derives the
+// Google TTS lookup tables from it.
+//
+// Three tiers (voice coverage verified live against Google Cloud TTS):
+//  1. "chirp3hd" - the 8 universal natural-sounding personas above exist in
+//     every one of these locales under the exact same name
+//     (e.g. de-DE-Chirp3-HD-Kore).
+//  2. "override" - only Wavenet/Standard tier is available, with fewer
+//     distinct voices than the 4 female + 4 male persona slots; explicit
+//     per-slot map below. Some (af, ca, eu, is, gl) have ONLY a single
+//     female voice, so every slot resolves to it.
+//  3. "none" - no Google voice. Translated TEXT only ("Text reply only").
+//     fa / zu / ga were served by ElevenLabs; that fallback now exists only
+//     behind the ELEVENLABS_ENABLED flag (config/ttsProviders.js, off by default).
+import { LANGUAGES } from "./languages.js";
+import { ELEVENLABS_ENABLED } from "./ttsProviders.js";
 
-// 40 languages with the full 8-persona Chirp3-HD tier.
-const CHIRP3HD_LANGUAGES = {
-  en: chirp3hd("en-US"),
-  es: chirp3hd("es-ES"),
-  fr: chirp3hd("fr-FR"),
-  de: chirp3hd("de-DE"),
-  it: chirp3hd("it-IT"),
-  pt: chirp3hd("pt-BR"),
-  ru: chirp3hd("ru-RU"),
-  uk: chirp3hd("uk-UA"),
-  nl: chirp3hd("nl-NL"),
-  pl: chirp3hd("pl-PL"),
-  sv: chirp3hd("sv-SE"),
-  no: chirp3hd("nb-NO"),
-  da: chirp3hd("da-DK"),
-  fi: chirp3hd("fi-FI"),
-  el: chirp3hd("el-GR"),
-  tr: chirp3hd("tr-TR"),
-  cs: chirp3hd("cs-CZ"),
-  hu: chirp3hd("hu-HU"),
-  ro: chirp3hd("ro-RO"),
-  bg: chirp3hd("bg-BG"),
-  ar: chirp3hd("ar-XA"),
-  he: chirp3hd("he-IL"),
-  hi: chirp3hd("hi-IN"),
-  pa: chirp3hd("pa-IN"),
-  bn: chirp3hd("bn-IN"),
-  gu: chirp3hd("gu-IN"),
-  mr: chirp3hd("mr-IN"),
-  ta: chirp3hd("ta-IN"),
-  te: chirp3hd("te-IN"),
-  kn: chirp3hd("kn-IN"),
-  ml: chirp3hd("ml-IN"),
-  ur: chirp3hd("ur-IN"),
-  zh: chirp3hd("cmn-CN"),
-  ja: chirp3hd("ja-JP"),
-  ko: chirp3hd("ko-KR"),
-  vi: chirp3hd("vi-VN"),
-  th: chirp3hd("th-TH"),
-  id: chirp3hd("id-ID"),
-  sw: chirp3hd("sw-KE"),
-  sr: chirp3hd("sr-RS"),
+const SLOT_ORDER = ["female_1", "female_2", "female_3", "female_4", "male_1", "male_2", "male_3", "male_4"];
+const slots = (...names) => Object.fromEntries(SLOT_ORDER.map((slot, i) => [slot, names[i]]));
+const single = (name) => slots(name, name, name, name, name, name, name, name);
+
+// Explicit voice maps for the "override" tier.
+const OVERRIDE_VOICES = {
+  ms: slots("ms-MY-Wavenet-A", "ms-MY-Wavenet-C", "ms-MY-Wavenet-A", "ms-MY-Wavenet-C",
+            "ms-MY-Wavenet-B", "ms-MY-Wavenet-D", "ms-MY-Wavenet-B", "ms-MY-Wavenet-D"),
+  am: slots("am-ET-Wavenet-A", "am-ET-Wavenet-A", "am-ET-Wavenet-A", "am-ET-Wavenet-A",
+            "am-ET-Wavenet-B", "am-ET-Wavenet-B", "am-ET-Wavenet-B", "am-ET-Wavenet-B"),
+  tl: slots("fil-PH-Wavenet-A", "fil-PH-Wavenet-B", "fil-PH-Wavenet-A", "fil-PH-Wavenet-B",
+            "fil-PH-Wavenet-C", "fil-PH-Wavenet-D", "fil-PH-Wavenet-C", "fil-PH-Wavenet-D"),
+  // Only one (female) voice exists for these - every slot resolves to it.
+  af: single("af-ZA-Standard-A"),
+  ca: single("ca-ES-Standard-B"),
+  eu: single("eu-ES-Standard-B"),
+  is: single("is-IS-Standard-B"),
+  gl: single("gl-ES-Standard-B"),
 };
 
-// 7 languages with only Wavenet/Standard voices — explicit per-voice-id
-// overrides, reusing real voices across slots where Google offers fewer
-// than 4 per gender, and falling back to the sole female voice for the
-// 4 languages with no male voice at all.
-const OVERRIDE_LANGUAGES = {
-  ms: {
-    tier: "override",
-    locale: "ms-MY",
-    voices: {
-      female_1: "ms-MY-Wavenet-A",
-      female_2: "ms-MY-Wavenet-C",
-      female_3: "ms-MY-Wavenet-A",
-      female_4: "ms-MY-Wavenet-C",
-      male_1: "ms-MY-Wavenet-B",
-      male_2: "ms-MY-Wavenet-D",
-      male_3: "ms-MY-Wavenet-B",
-      male_4: "ms-MY-Wavenet-D",
-    },
-  },
-  am: {
-    tier: "override",
-    locale: "am-ET",
-    voices: {
-      female_1: "am-ET-Wavenet-A",
-      female_2: "am-ET-Wavenet-A",
-      female_3: "am-ET-Wavenet-A",
-      female_4: "am-ET-Wavenet-A",
-      male_1: "am-ET-Wavenet-B",
-      male_2: "am-ET-Wavenet-B",
-      male_3: "am-ET-Wavenet-B",
-      male_4: "am-ET-Wavenet-B",
-    },
-  },
-  tl: {
-    tier: "override",
-    locale: "fil-PH",
-    voices: {
-      female_1: "fil-PH-Wavenet-A",
-      female_2: "fil-PH-Wavenet-B",
-      female_3: "fil-PH-Wavenet-A",
-      female_4: "fil-PH-Wavenet-B",
-      male_1: "fil-PH-Wavenet-C",
-      male_2: "fil-PH-Wavenet-D",
-      male_3: "fil-PH-Wavenet-C",
-      male_4: "fil-PH-Wavenet-D",
-    },
-  },
-  // No male voice exists at all for these 4 — every slot resolves to the
-  // single available female voice.
-  af: {
-    tier: "override",
-    locale: "af-ZA",
-    voices: {
-      female_1: "af-ZA-Standard-A",
-      female_2: "af-ZA-Standard-A",
-      female_3: "af-ZA-Standard-A",
-      female_4: "af-ZA-Standard-A",
-      male_1: "af-ZA-Standard-A",
-      male_2: "af-ZA-Standard-A",
-      male_3: "af-ZA-Standard-A",
-      male_4: "af-ZA-Standard-A",
-    },
-  },
-  ca: {
-    tier: "override",
-    locale: "ca-ES",
-    voices: {
-      female_1: "ca-ES-Standard-B",
-      female_2: "ca-ES-Standard-B",
-      female_3: "ca-ES-Standard-B",
-      female_4: "ca-ES-Standard-B",
-      male_1: "ca-ES-Standard-B",
-      male_2: "ca-ES-Standard-B",
-      male_3: "ca-ES-Standard-B",
-      male_4: "ca-ES-Standard-B",
-    },
-  },
-  eu: {
-    tier: "override",
-    locale: "eu-ES",
-    voices: {
-      female_1: "eu-ES-Standard-B",
-      female_2: "eu-ES-Standard-B",
-      female_3: "eu-ES-Standard-B",
-      female_4: "eu-ES-Standard-B",
-      male_1: "eu-ES-Standard-B",
-      male_2: "eu-ES-Standard-B",
-      male_3: "eu-ES-Standard-B",
-      male_4: "eu-ES-Standard-B",
-    },
-  },
-  is: {
-    tier: "override",
-    locale: "is-IS",
-    voices: {
-      female_1: "is-IS-Standard-B",
-      female_2: "is-IS-Standard-B",
-      female_3: "is-IS-Standard-B",
-      female_4: "is-IS-Standard-B",
-      male_1: "is-IS-Standard-B",
-      male_2: "is-IS-Standard-B",
-      male_3: "is-IS-Standard-B",
-      male_4: "is-IS-Standard-B",
-    },
-  },
-};
-
-// 3 languages with no Google Cloud TTS voice at all.
-const ELEVENLABS_ONLY_LANGUAGES = new Set(["fa", "zu", "ga"]);
-
-export const LANGUAGE_CONFIG = { ...CHIRP3HD_LANGUAGES, ...OVERRIDE_LANGUAGES };
-
-// Defensive fallback for older app builds that only send the language NAME
-// (e.g. "Chinese") instead of the new targetLanguageCode. Mirrors the labels
-// in the mobile app's src/utils/languages.js LANGUAGES array.
-const NAME_TO_CODE = {
-  english: "en", spanish: "es", french: "fr", german: "de", italian: "it",
-  portuguese: "pt", russian: "ru", ukrainian: "uk", dutch: "nl", polish: "pl",
-  swedish: "sv", norwegian: "no", danish: "da", finnish: "fi", greek: "el",
-  turkish: "tr", czech: "cs", hungarian: "hu", romanian: "ro", bulgarian: "bg",
-  arabic: "ar", hebrew: "he", persian: "fa", hindi: "hi", punjabi: "pa",
-  bengali: "bn", gujarati: "gu", marathi: "mr", tamil: "ta", telugu: "te",
-  kannada: "kn", malayalam: "ml", urdu: "ur", chinese: "zh", japanese: "ja",
-  korean: "ko", vietnamese: "vi", thai: "th", indonesian: "id", malay: "ms",
-  filipino: "tl", swahili: "sw", amharic: "am", zulu: "zu", afrikaans: "af",
-  catalan: "ca", basque: "eu", irish: "ga", icelandic: "is", serbian: "sr",
-};
-
-function capitalize(word) {
-  return word.charAt(0).toUpperCase() + word.slice(1);
-}
-
-// Inverse of NAME_TO_CODE — used by the voice-preview endpoint, which only
-// receives a language CODE from the mobile app and needs a language NAME to
-// pass to the GPT translation prompt.
-export const CODE_TO_NAME = Object.fromEntries(
-  Object.entries(NAME_TO_CODE).map(([name, code]) => [code, capitalize(name)])
+export const LANGUAGE_CONFIG = Object.fromEntries(
+  LANGUAGES.filter((l) => l.tts !== "none").map((l) => {
+    if (l.tts === "chirp3hd") return [l.code, { tier: "chirp3hd", locale: l.locale }];
+    const voices = OVERRIDE_VOICES[l.code];
+    if (!voices) throw new Error(`languages.js: "${l.code}" is tts:"override" but has no OVERRIDE_VOICES entry.`);
+    return [l.code, { tier: "override", locale: l.locale, voices }];
+  })
 );
 
+// Languages with an optional ElevenLabs fallback (only used when the flag is on).
+const ELEVENLABS_FALLBACK_LANGUAGES = new Set(
+  LANGUAGES.filter((l) => l.elevenLabsFallback).map((l) => l.code)
+);
+
+// Every language code the app may send.
+const KNOWN_CODES = new Set(LANGUAGES.map((l) => l.code));
+
+// Defensive fallback for older app builds that only send the language NAME
+// (e.g. "Chinese") instead of targetLanguageCode.
+const NAME_TO_CODE = Object.fromEntries(LANGUAGES.map((l) => [l.name.toLowerCase(), l.code]));
+
+// Used by the voice-preview endpoint (receives only a code) and the branding
+// outro to get the English language name for the GPT translation prompt.
+export const CODE_TO_NAME = Object.fromEntries(LANGUAGES.map((l) => [l.code, l.name]));
+
 export function resolveLanguageCode(targetLanguageCode, targetLanguageName) {
-  if (targetLanguageCode && (LANGUAGE_CONFIG[targetLanguageCode] || ELEVENLABS_ONLY_LANGUAGES.has(targetLanguageCode))) {
+  if (targetLanguageCode && KNOWN_CODES.has(targetLanguageCode)) {
     return targetLanguageCode;
   }
   const normalizedName = (targetLanguageName || "").trim().toLowerCase();
   return NAME_TO_CODE[normalizedName] || "en";
 }
 
+/** True when this language can be spoken (Google voice, or ElevenLabs fallback when enabled). */
+export function hasVoice(targetLanguageCode, targetLanguageName) {
+  const code = resolveLanguageCode(targetLanguageCode, targetLanguageName);
+  if (LANGUAGE_CONFIG[code]) return true;
+  return ELEVENLABS_ENABLED && ELEVENLABS_FALLBACK_LANGUAGES.has(code);
+}
+
 /**
- * Resolves a (languageCode, voiceId) pair to either a Google Cloud TTS
- * locale+voice name, or a signal to use the ElevenLabs fallback.
+ * Resolves a (languageCode, voiceId) pair to a Google Cloud TTS locale+voice
+ * name, to the (flagged, off by default) ElevenLabs fallback, or to
+ * { provider: "none" } meaning "translated text only, no audio".
  */
 export function resolveVoice(targetLanguageCode, targetLanguageName, voiceId) {
   const code = resolveLanguageCode(targetLanguageCode, targetLanguageName);
   const normalizedVoiceId = normalizeVoiceId(voiceId);
+  const config = LANGUAGE_CONFIG[code];
 
-  if (ELEVENLABS_ONLY_LANGUAGES.has(code)) {
-    // ElevenLabs (the fallback provider here) only knows "female"/"male" —
-    // translate our 8-value id down to its gender, so a user's male/female
-    // preference still carries over even on this narrow fallback path.
-    const elevenLabsVoiceId = normalizedVoiceId.startsWith("female") ? "female" : "male";
-    return { provider: "elevenlabs", languageCode: code, voiceId: elevenLabsVoiceId };
+  if (!config) {
+    if (ELEVENLABS_ENABLED && ELEVENLABS_FALLBACK_LANGUAGES.has(code)) {
+      // ElevenLabs only knows "female"/"male" - reduce our 8-value id to its gender.
+      const elevenLabsVoiceId = normalizedVoiceId.startsWith("female") ? "female" : "male";
+      return { provider: "elevenlabs", languageCode: code, voiceId: elevenLabsVoiceId };
+    }
+    return { provider: "none", languageCode: code };
   }
-
-  const config = LANGUAGE_CONFIG[code] || LANGUAGE_CONFIG.en;
 
   if (config.tier === "chirp3hd") {
     const persona = VOICE_PERSONAS[normalizedVoiceId];
