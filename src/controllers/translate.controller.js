@@ -7,7 +7,8 @@ import { generateTranslatedSpeech } from "../services/tts.service.js";
 import { getBrandingOutroBuffer } from "../services/brandingOutro.service.js";
 import User from "../models/User.js";
 import DeviceUsage from "../models/DeviceUsage.js";
-import { DEFAULT_VOICE_ID } from "../config/voiceCatalog.js";
+import { DEFAULT_VOICE_ID, hasVoice } from "../config/voiceCatalog.js";
+import { shouldSkipCharge } from "../utils/chargePolicy.js";
 import { parseBuffer } from "music-metadata";
 import { trimAudioBuffer } from "../services/audioTrim.service.js";
 import TranslateCharge from "../models/TranslateCharge.js";
@@ -172,10 +173,14 @@ export const translateMessage = async (req, res) => {
     let remainingFreeTranslations = null;
 
     if (req.usage) {
-      // A reply with no voice has nothing the user can send, so it doesn't
-      // use up a credit. (An inbound translation still does — the translated
-      // text is its main value.)
-      const skipCharge = isReply && !finalAudioBuffer;
+      // No charge only for a REAL failure: a reply whose language normally has
+      // a voice but the voice could not be produced. A reply in a text-only
+      // language costs 1 credit like any other reply (see utils/chargePolicy.js).
+      const skipCharge = shouldSkipCharge({
+        isReply,
+        hasAudio: Boolean(finalAudioBuffer),
+        languageHasVoice: hasVoice(targetLanguageCode, targetLanguage),
+      });
 
       // At most ONE charge per user action: the app re-sends the same
       // idempotency key on every retry, and the unique (uid, key) insert is

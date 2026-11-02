@@ -92,7 +92,7 @@ export const ERROR_TYPES = [
   "whisper_error",
   "translation_error",
   "google_tts_error",
-  "elevenlabs_error", // still reachable: silent fallback for fa/zu/ga (see tts.service.js)
+  "elevenlabs_error", // only if ELEVENLABS_ENABLED=true (off by default; see config/ttsProviders.js)
   "unknown_error",
 ];
 

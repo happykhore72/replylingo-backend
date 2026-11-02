@@ -39,6 +39,17 @@ assert.equal(CODE_TO_NAME.sk, "Slovak");
 // text-only language: no TTS call at all, returns null
 assert.equal(await generateTranslatedSpeech("hola", "yo", "Yoruba", "female_1"), null);
 if (!flagOn) assert.equal(await generateTranslatedSpeech("x", "fa", "Persian", "female_1"), null);
+import("../src/utils/chargePolicy.js").then(({ shouldSkipCharge }) => {
+  // reply, voice language, voice produced -> charged
+  assert.equal(shouldSkipCharge({ isReply: true, hasAudio: true, languageHasVoice: true }), false);
+  // reply, voice language, provider failed -> real failure, free
+  assert.equal(shouldSkipCharge({ isReply: true, hasAudio: false, languageHasVoice: true }), true);
+  // reply, TEXT-ONLY language -> charged (must not be free)
+  assert.equal(shouldSkipCharge({ isReply: true, hasAudio: false, languageHasVoice: false }), false);
+  // inbound translation -> always charged
+  assert.equal(shouldSkipCharge({ isReply: false, hasAudio: false, languageHasVoice: true }), false);
+  console.log("charge policy checks OK");
+});
 console.log("offline checks OK");
 
 if (process.argv.includes("--live")) {
