@@ -1,5 +1,7 @@
 import Usage from "../models/Usage.js";
 import User from "../models/User.js";
+import TranslateCharge from "../models/TranslateCharge.js";
+import { getIdempotencyKey } from "../utils/idempotency.js";
 import { touchDeviceUsage } from "../services/deviceUsage.service.js";
 
 const usageLimit = async (req, res, next) => {
@@ -55,6 +57,17 @@ const usageLimit = async (req, res, next) => {
     const freeUsed = Math.max(usage.usageCredits, deviceUsage?.usageCredits || 0);
 
     if (freeUsed >= usage.freeLimit) {
+      // A retry of an action that was ALREADY charged (the first attempt
+      // finished on the server but the response never reached the phone —
+      // typically the one that used the last credit) must be allowed to
+      // finish and deliver its result; the controller won't charge it again.
+      const idempotencyKey = getIdempotencyKey(req);
+      if (idempotencyKey && (await TranslateCharge.exists({ uid, key: idempotencyKey }))) {
+        console.log("Limit reached, but this is a retry of an already-charged action:", uid);
+        req.usage = usage;
+        return next();
+      }
+
       console.log("Free translation limit reached for uid (backoff):", uid);
       return res.status(403).json({
         success: false,

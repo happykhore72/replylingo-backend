@@ -55,6 +55,14 @@ console.log(user);
     res.status(200).json({
       success: true,
       isNewUser: req.isNewUser === true,
+      // Soft "please update" prompt. Set MIN_APP_VERSION_IOS /
+      // MIN_APP_VERSION_ANDROID on Vercel (e.g. "1.9.0"); unset = no prompt.
+      appConfig: {
+        minVersion: {
+          ios: process.env.MIN_APP_VERSION_IOS || null,
+          android: process.env.MIN_APP_VERSION_ANDROID || null,
+        },
+      },
       user: {
         uid: req.user.uid,
         email: user?.email ?? req.user.email ?? null,

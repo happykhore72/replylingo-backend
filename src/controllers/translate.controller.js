@@ -10,6 +10,8 @@ import DeviceUsage from "../models/DeviceUsage.js";
 import { DEFAULT_VOICE_ID } from "../config/voiceCatalog.js";
 import { parseBuffer } from "music-metadata";
 import { trimAudioBuffer } from "../services/audioTrim.service.js";
+import TranslateCharge from "../models/TranslateCharge.js";
+import { getIdempotencyKey } from "../utils/idempotency.js";
 
 // Was capped at 60s, but "Audio too long" turned out to be the single
 // largest translation-failure category in production (38.5% of failures) —
@@ -175,7 +177,36 @@ export const translateMessage = async (req, res) => {
       // text is its main value.)
       const skipCharge = isReply && !finalAudioBuffer;
 
-      if (!skipCharge) {
+      // At most ONE charge per user action: the app re-sends the same
+      // idempotency key on every retry, and the unique (uid, key) insert is
+      // the atomic claim. A duplicate-key error means an earlier attempt of
+      // this same action was already charged (its response just got lost on
+      // the way to the phone), so this retry delivers the result for free.
+      let chargeClaimed = false;
+      let chargeAllowed = true;
+      const idempotencyKey = getIdempotencyKey(req);
+      // Never logs the key itself. Lets you confirm the proxy forwards it.
+      console.log(
+        "[idempotency] key via",
+        req.get("x-idempotency-key") ? "header" : req.body?.idempotencyKey ? "form-field" : "NONE"
+      );
+      if (!skipCharge && idempotencyKey) {
+        try {
+          await TranslateCharge.create({ uid: req.user.uid, key: idempotencyKey });
+          chargeClaimed = true;
+        } catch (claimError) {
+          if (claimError?.code === 11000) {
+            chargeAllowed = false;
+            console.log("Retry of an already-charged action - not charging again:", req.user.uid);
+          } else {
+            // Can't tell: charge as before rather than give the work away.
+            console.error("[idempotency] claim failed (charging anyway):", claimError.message);
+          }
+        }
+      }
+
+      if (!skipCharge && chargeAllowed) {
+       try {
         // Free tier = 3 credits: an uploaded/shared voice note costs 0.5, the
         // reply the user records costs 1 (on either screen). The in-app
         // sample never reaches the server, so it costs nothing.
@@ -203,6 +234,13 @@ export const translateMessage = async (req, res) => {
         }
         req.usage.estimatedCostUsd = (req.usage.estimatedCostUsd || 0) + ESTIMATED_COST_PER_CALL_USD;
         await req.usage.save();
+       } catch (chargeError) {
+        // The charge didn't land: free the claim so the retry can charge.
+        if (chargeClaimed) {
+          await TranslateCharge.deleteOne({ uid: req.user.uid, key: idempotencyKey }).catch(() => {});
+        }
+        throw chargeError;
+       }
       }
 
       if (!isPremium) {
