@@ -53,8 +53,25 @@ export const generateTranslatedSpeech = async (
     }
   }
 
+  // Google failed twice: fall back to ElevenLabs (when an API key is set)
+  // before degrading to text-only.
+  if (process.env.ELEVENLABS_API_KEY) {
+    try {
+      const { generateSpeech: generateSpeechElevenLabs } = await import("./elevenlabs.service.js");
+      // ElevenLabs only knows "female"/"male"; our ids are e.g. "female_1".
+      const gender = String(voiceId || "").toLowerCase().startsWith("male") ? "male" : "female";
+      const audio = await generateSpeechElevenLabs(text, gender);
+      console.log(`TTS: ElevenLabs fallback succeeded for locale "${resolved.locale}".`);
+      return audio;
+    } catch (error) {
+      console.error(`TTS fallback (ElevenLabs) failed for locale "${resolved.locale}":`, error.message);
+    }
+  } else {
+    console.error("TTS: Google failed and ELEVENLABS_API_KEY is not set, no fallback available.");
+  }
+
   console.error(
-    `TTS (Google) failed for locale "${resolved.locale}", degrading to text-only.`
+    `TTS failed for locale "${resolved.locale}", degrading to text-only.`
   );
   return null;
 };

@@ -5,9 +5,6 @@ dotenv.config();
 
 
 export function getVoiceMap() {
-  console.log("FEMALE ENV:", process.env.ELEVENLABS_VOICE_ID_FEMALE);
-  console.log("MALE ENV:", process.env.ELEVENLABS_VOICE_ID_MALE);
-
   return {
     female:
       process.env.ELEVENLABS_VOICE_ID_FEMALE || "21m00Tcm4TlvDq8ikWAM",
