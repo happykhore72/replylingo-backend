@@ -242,7 +242,23 @@ const syncPremium = async (req, res) => {
 // only — Expo's push service resolves iOS/Android delivery itself (see pushNotification.service.js).
 const savePushToken = async (req, res) => {
   try {
-    const { pushToken, platform } = req.body;
+    const { pushToken, platform, appLanguage } = req.body;
+
+    // Optional app language (e.g. "en", "pt-BR" -> "pt"). Invalid values are
+    // ignored rather than failing token registration.
+    const lang =
+      typeof appLanguage === "string" && /^[A-Za-z]{2,3}([-_][A-Za-z0-9]{2,8})?$/.test(appLanguage.trim())
+        ? appLanguage.trim().split(/[-_]/)[0].toLowerCase()
+        : null;
+
+    // Language-only update (app language changed in Settings): token untouched.
+    if (pushToken === undefined) {
+      if (!lang) {
+        return res.status(400).json({ success: false, message: "pushToken or a valid appLanguage is required." });
+      }
+      await User.findOneAndUpdate({ uid: req.user.uid }, { $set: { appLanguage: lang } }, { upsert: true });
+      return res.status(200).json({ success: true });
+    }
 
     if (pushToken !== null && typeof pushToken !== "string") {
       return res.status(400).json({
@@ -259,7 +275,7 @@ const savePushToken = async (req, res) => {
     }
 
     const update = pushToken
-      ? { pushToken, pushPlatform: platform || null }
+      ? { pushToken, pushPlatform: platform || null, ...(lang ? { appLanguage: lang } : {}) }
       : { pushToken: null, pushPlatform: null };
 
     await User.findOneAndUpdate({ uid: req.user.uid }, { $set: update }, { upsert: true, new: true });

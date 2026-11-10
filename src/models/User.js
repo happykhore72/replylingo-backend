@@ -55,6 +55,14 @@ const userSchema = new mongoose.Schema(
       default: null,
     },
 
+    // The language the user has the APP set to (base code, e.g. "en", "ur"),
+    // reported by the client with push-token registration / on language change.
+    // Used to localize pushes. null = client never reported one.
+    appLanguage: {
+      type: String,
+      default: null,
+    },
+
     lastActiveAt: {
       type: Date,
       default: Date.now,

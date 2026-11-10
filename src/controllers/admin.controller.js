@@ -2,6 +2,7 @@ import Event from "../models/Event.js";
 import User from "../models/User.js";
 import AiCallLog from "../models/AiCallLog.js";
 import PurchaseSurvey from "../models/PurchaseSurvey.js";
+import CreditsCampaignRecipient from "../models/CreditsCampaignRecipient.js";
 import { SURVEY_REASONS, SURVEY_USE_CASES, SURVEY_PLATFORMS } from "../config/purchaseSurvey.js";
 import {
   PUSH_PLATFORMS,
@@ -100,6 +101,101 @@ async function uniqueUserCountsByParam(eventName, paramKey, from, to, extraMatch
     map[String(r._id)] = r.count;
   });
   return map;
+}
+
+// Signup method breakdown (unique people per method).
+//
+// Besides the signup_completed events, this also counts guest -> Google/Apple
+// UPGRADES that older app versions logged as login_completed: an upgrade keeps
+// the guest's uid, so the backend never saw a "new user" and the app sent
+// login_completed(google|apple). Those events are recognised by their uid
+// having an earlier signup_completed(guest) event. This fixes old data too.
+// New app versions send signup_completed(google|apple) directly; both sources
+// are merged by distinctId so nobody is counted twice for the same method.
+async function getSignupMethodCounts(from, to) {
+  const sets = {};
+  const add = (method, distinctId) => {
+    const m = String(method);
+    if (!sets[m]) sets[m] = new Set();
+    sets[m].add(distinctId);
+  };
+
+  const direct = await Event.aggregate([
+    { $match: { eventName: EVENTS.SIGNUP_COMPLETED, createdAt: { $gte: from, $lte: to } } },
+    { $group: { _id: { method: "$params.method", distinctId: "$distinctId" } } },
+  ]);
+  direct.forEach((r) => add(r._id.method, r._id.distinctId));
+
+  const logins = await Event.aggregate([
+    {
+      $match: {
+        eventName: "login_completed",
+        createdAt: { $gte: from, $lte: to },
+        "params.method": { $in: ["google", "apple"] },
+        uid: { $ne: null },
+      },
+    },
+    { $group: { _id: { method: "$params.method", distinctId: "$distinctId", uid: "$uid" } } },
+  ]);
+  if (logins.length > 0) {
+    const guestUids = new Set(
+      await Event.distinct("uid", {
+        eventName: EVENTS.SIGNUP_COMPLETED,
+        "params.method": "guest",
+        uid: { $in: [...new Set(logins.map((r) => r._id.uid))] },
+      })
+    );
+    logins.forEach((r) => {
+      if (guestUids.has(r._id.uid)) add(r._id.method, r._id.distinctId);
+    });
+  }
+
+  const counts = {};
+  Object.entries(sets).forEach(([method, set]) => {
+    counts[method] = set.size;
+  });
+  return counts;
+}
+
+// Paywall viewers who actually SAW the free trial, split by platform.
+// One paywall_trial_shown event is sent per paywall visit. Older app versions
+// only sent `eligible`; newer ones send trial_shown (same meaning) + reason.
+async function getPaywallTrialByPlatform(from, to) {
+  const rows = await Event.aggregate([
+    { $match: { eventName: EVENTS.PAYWALL_TRIAL_SHOWN, createdAt: { $gte: from, $lte: to } } },
+    {
+      $project: {
+        distinctId: 1,
+        platform: { $ifNull: ["$platform", "unknown"] },
+        shown: { $cond: [{ $eq: [{ $ifNull: ["$params.trial_shown", "$params.eligible"] }, true] }, 1, 0] },
+        reason: { $ifNull: ["$params.reason", null] },
+      },
+    },
+    // One row per person: they "saw the trial" if ANY visit showed it.
+    {
+      $group: {
+        _id: { platform: "$platform", distinctId: "$distinctId" },
+        shown: { $max: "$shown" },
+        reasons: { $addToSet: "$reason" },
+      },
+    },
+  ]);
+  const out = {};
+  rows.forEach((r) => {
+    const key = r._id.platform;
+    if (!out[key]) out[key] = { viewers: 0, trialShown: 0, trialShownRate: 0, notShownReasons: {} };
+    out[key].viewers += 1;
+    if (r.shown === 1) {
+      out[key].trialShown += 1;
+    } else {
+      const reason = r.reasons.find((x) => x) || "unknown";
+      out[key].notShownReasons[reason] = (out[key].notShownReasons[reason] || 0) + 1;
+    }
+  });
+  Object.values(out).forEach((v) => {
+    v.trialShownRate = pct(v.trialShown, v.viewers);
+  });
+  return out;
 }
 
 async function totalCountsByParam(eventName, paramKey, from, to, extraMatch = {}) {
@@ -528,12 +624,13 @@ const getFunnelReport = async (req, res) => {
       translationEventTotals,
       sampleEventTotals,
       failedUsers,
+      paywallTrialByPlatform,
     ] = await Promise.all([
       uniqueUserCounts(topLevelEventNames, from, to),
       totalCounts([EVENTS.APP_OPEN], from, to),
       uniqueUserCountsByParam(EVENTS.ONBOARDING_SLIDE_VIEWED, "slide_number", from, to),
       uniqueUserCountsByParam(EVENTS.ONBOARDING_SLIDE_COMPLETED, "slide_number", from, to),
-      uniqueUserCountsByParam(EVENTS.SIGNUP_COMPLETED, "method", from, to),
+      getSignupMethodCounts(from, to),
       totalCountsByParam(EVENTS.PERMISSION_SHOWN, "type", from, to),
       totalCountsByParam(EVENTS.PERMISSION_GRANTED, "type", from, to),
       totalCountsByParam(EVENTS.PERMISSION_DENIED, "type", from, to),
@@ -592,6 +689,7 @@ const getFunnelReport = async (req, res) => {
       ),
       totalCounts([EVENTS.TRANSLATION_SUCCEEDED], from, to, SAMPLE_ONLY),
       uniqueUsersAcross([EVENTS.TRANSLATION_FAILED, EVENTS.AUDIO_UPLOAD_FAILED], from, to),
+      getPaywallTrialByPlatform(from, to),
     ]);
 
     // Replace the translation-related unique-user counts with the real-only
@@ -703,6 +801,7 @@ const getFunnelReport = async (req, res) => {
       const paywallViewedUsers = platformPaywallViewedUsers[key] || 0;
       const purchaseCompletedUsers = platformPurchaseCompleted[key] || 0;
       monetizationByPlatform[key] = {
+        trialVisibility: paywallTrialByPlatform[key] || null,
         users: platformAppOpen[key] || 0,
         paywallViewedUsers,
         paywallViewedEvents: platformPaywallViewedEvents[key] || 0,
@@ -748,7 +847,7 @@ const getFunnelReport = async (req, res) => {
         byMethod: Object.fromEntries(
           Object.entries(signupMethodCounts).map(([method, count]) => [
             method,
-            { count, pct: pct(count, topLevelUnique[EVENTS.SIGNUP_COMPLETED]) },
+            { count, pct: pct(count, Object.values(signupMethodCounts).reduce((a, b) => a + b, 0)) },
           ])
         ),
       },
@@ -1234,4 +1333,41 @@ const getPurchaseSurveyReport = async (req, res) => {
   }
 };
 
-export { getFunnelReport, getUserJourney, getAiUsageReport, getTrafficReport, getNotificationAudience, sendNotification, getPurchaseSurveyReport };
+// GET /api/admin/credits-back-report?secret=...&campaign=credits_back_nov2026
+// Per-campaign impact over the 7 days after each recipient was pushed (or, for
+// recipients who were reset but not pushed, after their credits reset). Splits
+// pushed vs not-pushed so the push effect can be separated from the credit reset.
+const getCreditsBackReport = async (req, res) => {
+  if (!isAuthorized(req)) return res.status(401).json({ success: false, message: "Unauthorized." });
+  try {
+    const campaign = req.query.campaign || "credits_back_nov2026";
+    const rows = await CreditsCampaignRecipient.find({ campaign }).lean();
+    const start = new Map(rows.map((r) => [r.uid, r.sentAt || r.creditsResetAt]));
+    const names = [EVENTS.TRANSLATION_SUCCEEDED, EVENTS.SUB_TRIAL_STARTED, EVENTS.SUB_PAID_STARTED, EVENTS.SUB_TRIAL_CONVERTED];
+    const events = await Event.find({ uid: { $in: [...start.keys()] }, eventName: { $in: names } })
+      .select("eventName uid createdAt params.revenue_usd").lean();
+    const groups = {};
+    const g = (k) => (groups[k] ||= { users: 0, translations: 0, translatingUsers: new Set(), trials: 0, paid: 0, revenueUsd: 0 });
+    const keyOf = (r) => (r.status === "sent" ? "pushed" : "not_pushed");
+    rows.forEach((r) => { g(keyOf(r)).users++; g("all").users++; });
+    const byUid = new Map(rows.map((r) => [r.uid, r]));
+    for (const e of events) {
+      const s = start.get(e.uid);
+      if (!s || e.createdAt < s || e.createdAt > new Date(s.getTime() + 7 * DAY_MS)) continue;
+      for (const k of [keyOf(byUid.get(e.uid)), "all"]) {
+        const x = g(k);
+        if (e.eventName === EVENTS.TRANSLATION_SUCCEEDED) { x.translations++; x.translatingUsers.add(e.uid); }
+        else if (e.eventName === EVENTS.SUB_TRIAL_STARTED) x.trials++;
+        else { if (e.eventName === EVENTS.SUB_PAID_STARTED) x.paid++; x.revenueUsd += Number(e.params?.revenue_usd) || 0; }
+      }
+    }
+    Object.values(groups).forEach((x) => { x.translatingUsers = x.translatingUsers.size; });
+    const statusCounts = rows.reduce((m, r) => ((m[r.status] = (m[r.status] || 0) + 1), m), {});
+    res.json({ success: true, campaign, windowDays: 7, statusCounts, groups });
+  } catch (error) {
+    console.error("[admin] credits-back report failed:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export { getCreditsBackReport, getFunnelReport, getUserJourney, getAiUsageReport, getTrafficReport, getNotificationAudience, sendNotification, getPurchaseSurveyReport };

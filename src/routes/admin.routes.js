@@ -1,11 +1,12 @@
 import express from "express";
-import { getFunnelReport, getUserJourney, getAiUsageReport, getTrafficReport, getNotificationAudience, sendNotification, getPurchaseSurveyReport } from "../controllers/admin.controller.js";
+import { getCreditsBackReport, getFunnelReport, getUserJourney, getAiUsageReport, getTrafficReport, getNotificationAudience, sendNotification, getPurchaseSurveyReport } from "../controllers/admin.controller.js";
 
 const router = express.Router();
 
 // Shared-secret protected (see admin.controller.js's isAuthorized), same
 // pattern as notifications.routes.js — there's no admin-role concept on
 // User yet, and these are meant for direct browser/curl use, not the app.
+router.get("/credits-back-report", getCreditsBackReport);
 router.get("/funnel", getFunnelReport);
 router.get("/user-journey", getUserJourney);
 router.get("/ai-usage", getAiUsageReport);
